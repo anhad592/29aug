@@ -631,10 +631,9 @@ async def seed_db():
         await db.users.insert_many([admin, user])
         logger.info("Seeded default users")
     else:
-        # Backfill otp_login: admins default ON (preserves existing behaviour),
-        # non-admins default OFF. Only sets the field where it is missing.
-        await db.users.update_many({"otp_login": {"$exists": False}, "role": "admin"}, {"$set": {"otp_login": False}})
-        await db.users.update_many({"otp_login": {"$exists": False}, "role": {"$ne": "admin"}}, {"$set": {"otp_login": False}})
+        # OTP login is disabled globally — force it OFF for every user so no
+        # one is ever prompted for a second-step email code.
+        await db.users.update_many({}, {"$set": {"otp_login": False}})
         # Backfill username for any pre-existing user (local-part of email, deduped)
         seen = set(u.get("username") for u in await db.users.find({"username": {"$exists": True}}, {"_id": 0, "username": 1}).to_list(1000) if u.get("username"))
         async for u in db.users.find({"username": {"$exists": False}}, {"_id": 0}):
@@ -772,12 +771,12 @@ async def login(body: UserIn):
     if not user or not verify_password(body.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # ── Two-step verification (email OTP) — per-user toggle ───────────────
-    # Admin can turn this ON/OFF for any user from Admin → Users. When ON,
-    # the user must complete an email OTP as a second step. The OTP is sent
-    # to the same email configured for the daily database backup, reusing
-    # those Gmail credentials.
-    if user.get("otp_login"):
+    # ── Two-step verification (email OTP) — DISABLED ─────────────────────
+    # OTP login has been turned off for all users. Everyone now logs in
+    # directly with their password (single step). The block below is kept
+    # for reference but never runs because the guard is forced off.
+    OTP_LOGIN_ENABLED = False
+    if OTP_LOGIN_ENABLED and user.get("otp_login"):
         import random
         code = f"{random.randint(0, 999999):06d}"
         challenge_id = str(uuid.uuid4())
@@ -1803,21 +1802,36 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
     # dispatches collection so the UI can show "what was dispatched".
     order_ids = [o["id"] for o in items]
     disp_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    # Date-grouped dispatch history per order → powers the "All Status" brief
+    # (what was shipped, and on which day). oid → dayISO → item_key → row
+    disp_dates: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
     if order_ids:
         oid_set = set(order_ids)
         async for d in db.dispatches.find(
             {"$or": [{"order_id": {"$in": order_ids}}, {"order_ids": {"$in": order_ids}}]},
-            {"_id": 0, "order_id": 1, "order_ids": 1, "items": 1},
+            {"_id": 0, "order_id": 1, "order_ids": 1, "items": 1,
+             "dispatched_at": 1, "last_dispatched_at": 1, "slip_no": 1},
         ):
             targets = []
             if d.get("order_id") in oid_set:
                 targets = [d["order_id"]]
             else:
                 targets = [oid for oid in (d.get("order_ids") or []) if oid in oid_set]
+            # Resolve the dispatch day (YYYY-MM-DD) for grouping the brief.
+            dts = d.get("dispatched_at") or d.get("last_dispatched_at")
+            day = ""
+            if dts:
+                try:
+                    dd = datetime.fromisoformat(str(dts).replace("Z", "+00:00"))
+                    day = dd.date().isoformat()
+                except Exception:
+                    day = str(dts)[:10]
             for oid in targets:
                 bucket = disp_map.setdefault(oid, {})
+                day_bucket = disp_dates.setdefault(oid, {}).setdefault(day, {})
                 for it in (d.get("items") or []):
                     key = it.get("item_id") or it.get("item_name") or ""
+                    qty = int(it.get("quantity") or 0)
                     row = bucket.setdefault(key, {
                         "item_id": it.get("item_id"),
                         "item_name": it.get("item_name"),
@@ -1825,7 +1839,42 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
                         "variant": it.get("variant"),
                         "quantity": 0,
                     })
-                    row["quantity"] += int(it.get("quantity") or 0)
+                    row["quantity"] += qty
+                    drow = day_bucket.setdefault(key, {
+                        "item_id": it.get("item_id"),
+                        "item_name": it.get("item_name"),
+                        "product_name": it.get("product_name"),
+                        "variant": it.get("variant"),
+                        "quantity": 0,
+                    })
+                    drow["quantity"] += qty
+
+    # ── Discrepancy detection ────────────────────────────────────────────
+    # Catch the case where goods were DISPATCHED before the matching order
+    # was actually punched in (a back-dated order entered after the slip).
+    # For each still-Pending order we look for a dispatch to the SAME party,
+    # sharing at least one SKU, that is NOT linked to this order and whose
+    # dispatch date PRE-DATES the order's entry (created_at). We pull every
+    # dispatch for the referenced customers once and match in-memory.
+    def _parse_iso(s):
+        if not s:
+            return None
+        try:
+            d = datetime.fromisoformat(str(s).replace("Z", "+00:00")) if isinstance(s, str) else s
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            return d
+        except Exception:
+            return None
+
+    cust_disp: Dict[str, List[Dict[str, Any]]] = {}
+    if cust_ids:
+        async for d in db.dispatches.find(
+            {"customer_id": {"$in": cust_ids}},
+            {"_id": 0, "id": 1, "slip_no": 1, "order_id": 1, "order_ids": 1,
+             "customer_id": 1, "items": 1, "dispatched_at": 1},
+        ):
+            cust_disp.setdefault(d.get("customer_id") or "", []).append(d)
 
     for o in items:
         days_open = None
@@ -1844,6 +1893,59 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
         o["customer_city"] = loc.get("city", "")
         o["customer_location"] = loc.get("location", "")
         o["dispatched_items"] = list(disp_map.get(o["id"], {}).values())
+        # Date-grouped brief: [{date, items:[...]}, ...] sorted oldest→newest.
+        day_map = disp_dates.get(o["id"], {})
+        o["dispatch_summary"] = [
+            {"date": day, "items": list(rows.values())}
+            for day, rows in sorted(day_map.items(), key=lambda kv: kv[0])
+        ]
+
+        # Attach a discrepancy suggestion if one is found (and not dismissed).
+        o["discrepancy"] = None
+        if o.get("status") == "Pending" and not o.get("discrepancy_dismissed"):
+            entered = _parse_iso(o.get("created_at"))
+            # Set of this order's SKUs by id and by normalised name.
+            oid_ids = {it.get("item_id") for it in (o.get("items") or []) if it.get("item_id")}
+            oid_names = {(it.get("item_name") or "").strip().lower()
+                         for it in (o.get("items") or []) if it.get("item_name")}
+            best = None
+            best_dt = None
+            for d in cust_disp.get(o.get("customer_id") or "", []):
+                # Skip dispatches already linked to THIS order.
+                if d.get("order_id") == o["id"] or o["id"] in (d.get("order_ids") or []):
+                    continue
+                disp_dt = _parse_iso(d.get("dispatched_at"))
+                if not disp_dt or not entered:
+                    continue
+                # Core signal: goods shipped BEFORE this order was entered.
+                if not (disp_dt < entered):
+                    continue
+                # Require at least one shared SKU.
+                matched = []
+                for it in (d.get("items") or []):
+                    iid = it.get("item_id")
+                    inm = (it.get("item_name") or "").strip().lower()
+                    if (iid and iid in oid_ids) or (inm and inm in oid_names):
+                        matched.append({
+                            "item_name": it.get("item_name"),
+                            "product_name": it.get("product_name"),
+                            "variant": it.get("variant"),
+                            "quantity": int(it.get("quantity") or 0),
+                        })
+                if not matched:
+                    continue
+                # Prefer the most recent qualifying dispatch.
+                if best_dt is None or disp_dt > best_dt:
+                    best_dt = disp_dt
+                    best = {
+                        "dispatch_id": d.get("id"),
+                        "slip_no": d.get("slip_no"),
+                        "dispatched_at": d.get("dispatched_at"),
+                        "order_date": o.get("order_date"),
+                        "entered_at": o.get("created_at"),
+                        "items": matched,
+                    }
+            o["discrepancy"] = best
     return items
 
 
@@ -1903,6 +2005,87 @@ async def delete_order(oid: str, user=Depends(require_action("delete:orders"))):
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Order not found")
     return {"ok": True}
+
+
+class DiscrepancyResolveIn(BaseModel):
+    # One of: "update_date" | "clear" | "delete" | "keep"
+    action: str
+    dispatch_id: Optional[str] = None
+
+
+@api_router.post("/orders/{oid}/resolve-discrepancy")
+async def resolve_discrepancy(oid: str, body: DiscrepancyResolveIn,
+                              user=Depends(get_current_user)):
+    """Resolve a dispatch-before-order discrepancy on a Pending order.
+
+    Actions:
+      • update_date → set the order's date to the dispatch date, then dismiss.
+      • clear       → reconcile: link the dispatch to this order and mark the
+                      order Dispatched (its items were already shipped).
+      • delete      → remove this (duplicate) order entry.
+      • keep        → keep it Pending and stop flagging (dismiss the prompt).
+    """
+    action = (body.action or "").strip()
+    if action not in ("update_date", "clear", "delete", "keep"):
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    order = await db.orders.find_one({"id": oid}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # Permission: deleting needs delete rights; everything else needs edit.
+    need = "delete:orders" if action == "delete" else "edit:orders"
+    if not has_action_permission(user, need):
+        raise HTTPException(status_code=403, detail="You don't have permission for this action.")
+
+    if action == "delete":
+        await db.orders.delete_one({"id": oid})
+        return {"ok": True, "action": action, "deleted": True}
+
+    if action == "keep":
+        await db.orders.update_one(
+            {"id": oid},
+            {"$set": {"discrepancy_dismissed": True, "updated_at": now_iso()}},
+        )
+        return {"ok": True, "action": action, "order": await db.orders.find_one({"id": oid}, {"_id": 0})}
+
+    # The remaining actions reference the matched dispatch.
+    disp = None
+    if body.dispatch_id:
+        disp = await db.dispatches.find_one({"id": body.dispatch_id}, {"_id": 0})
+    if not disp:
+        raise HTTPException(status_code=404, detail="Linked dispatch not found")
+
+    if action == "update_date":
+        # Align the order's date with the day the goods actually went out.
+        await db.orders.update_one(
+            {"id": oid},
+            {"$set": {"order_date": disp.get("dispatched_at") or order.get("order_date"),
+                      "discrepancy_dismissed": True, "updated_at": now_iso()}},
+        )
+        return {"ok": True, "action": action, "order": await db.orders.find_one({"id": oid}, {"_id": 0})}
+
+    # action == "clear" → reconcile the order against the existing dispatch.
+    # Link this order onto the dispatch for traceability …
+    order_ids = list(disp.get("order_ids") or [])
+    if oid not in order_ids:
+        order_ids.append(oid)
+    await db.dispatches.update_one(
+        {"id": disp["id"]},
+        {"$set": {"order_ids": order_ids, "order_fully_dispatched": True,
+                  "updated_at": now_iso()}},
+    )
+    # … and mark the order Dispatched (its items were already shipped).
+    if "original_items" not in order:
+        await db.orders.update_one(
+            {"id": oid}, {"$set": {"original_items": order.get("items") or []}}
+        )
+    await db.orders.update_one(
+        {"id": oid},
+        {"$set": {"items": [], "status": "Dispatched",
+                  "discrepancy_dismissed": True, "updated_at": now_iso()}},
+    )
+    return {"ok": True, "action": action, "order": await db.orders.find_one({"id": oid}, {"_id": 0})}
 
 
 # ======================== Dashboard Summary ========================
